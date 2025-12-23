@@ -13,6 +13,7 @@
  */
 
 import express, { Request, Response, NextFunction } from 'express';
+import { connectDB } from './config/database';
 import apiRouter from './routes';
 
 /**
@@ -83,17 +84,24 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 // ============================================================================
 
 /**
- * Start the HTTP server.
- * Listens on the configured port and logs startup confirmation.
+ * Start the HTTP server after connecting to MongoDB.
+ * First connects to the database, then starts listening on the configured port.
  */
-app.listen(PORT, () => {
-	console.log(`
+async function startServer(): Promise<void> {
+	try {
+		// Connect to MongoDB
+		await connectDB();
+
+		// Start Express server
+		app.listen(PORT, () => {
+			console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║           JharkhandYatra API Server                       ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Status:    Running                                       ║
 ║  Port:      ${String(PORT).padEnd(45)}║
 ║  Base URL:  http://localhost:${String(PORT).padEnd(30)}║
+║  Database:  MongoDB Connected                             ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Endpoints:                                               ║
 ║  • GET  /api/health      - Health check                   ║
@@ -103,5 +111,13 @@ app.listen(PORT, () => {
 ║  • CRUD /api/bookings    - Booking management             ║
 ║  • GET  /api/search      - Unified search                 ║
 ╚═══════════════════════════════════════════════════════════╝
-	`);
-});
+			`);
+		});
+	} catch (error) {
+		console.error('Failed to start server:', error);
+		process.exit(1);
+	}
+}
+
+// Start the server
+startServer();

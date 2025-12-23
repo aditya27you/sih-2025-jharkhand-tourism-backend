@@ -95,14 +95,3 @@ export function parsePaginationParams(
 	return { page: parsedPage, limit: parsedLimit };
 }
 
-/**
- * Generates a unique ID for in-memory storage.
- * In production, this would be replaced by database-generated IDs.
- *
- * @returns A MongoDB-like ObjectId string
- */
-export function generateId(): string {
-	const timestamp = Math.floor(Date.now() / 1000).toString(16);
-	const random = Math.random().toString(16).substring(2, 18);
-	return timestamp + random.padEnd(16, '0');
-}
