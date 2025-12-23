@@ -2,21 +2,20 @@
  * Homestays Controller
  *
  * Handles all CRUD operations for homestay listings.
+ * Uses MongoDB via Mongoose for data persistence.
  */
 
 import { Request, Response } from 'express';
 import {
-	Homestay,
+	HomestayModel,
 	CreateHomestayInput,
-	UpdateHomestayInput,
-	homestaysStore
+	UpdateHomestayInput
 } from '../models/homestays/Homestay.model';
 import {
 	sendSuccess,
 	sendError,
 	getPaginationMeta,
-	parsePaginationParams,
-	generateId
+	parsePaginationParams
 } from '../utils/response.utils';
 
 /**
@@ -31,40 +30,50 @@ import {
  * - minPrice: Minimum base price filter
  * - maxPrice: Maximum base price filter
  */
-export function getAllHomestays(req: Request, res: Response): void {
-	const { page, limit } = parsePaginationParams(
-		req.query.page as string,
-		req.query.limit as string
-	);
-	const district = req.query.district as string | undefined;
-	const minPrice = req.query.minPrice ? parseInt(req.query.minPrice as string, 10) : undefined;
-	const maxPrice = req.query.maxPrice ? parseInt(req.query.maxPrice as string, 10) : undefined;
-
-	// Apply filters
-	let filtered = homestaysStore.filter(h => h.status === 'active');
-
-	if (district) {
-		filtered = filtered.filter(h =>
-			h.location.district.toLowerCase() === district.toLowerCase()
+export async function getAllHomestays(req: Request, res: Response): Promise<void> {
+	try {
+		const { page, limit } = parsePaginationParams(
+			req.query.page as string,
+			req.query.limit as string
 		);
+		const district = req.query.district as string | undefined;
+		const minPrice = req.query.minPrice ? parseInt(req.query.minPrice as string, 10) : undefined;
+		const maxPrice = req.query.maxPrice ? parseInt(req.query.maxPrice as string, 10) : undefined;
+
+		// Build query filter
+		const filter: Record<string, unknown> = { status: 'active' };
+
+		if (district) {
+			filter['location.district'] = new RegExp(`^${district}$`, 'i');
+		}
+
+		if (minPrice !== undefined || maxPrice !== undefined) {
+			filter['pricing.basePrice'] = {};
+			if (minPrice !== undefined) {
+				(filter['pricing.basePrice'] as Record<string, number>).$gte = minPrice;
+			}
+			if (maxPrice !== undefined) {
+				(filter['pricing.basePrice'] as Record<string, number>).$lte = maxPrice;
+			}
+		}
+
+		// Execute query with pagination
+		const [homestays, totalResults] = await Promise.all([
+			HomestayModel.find(filter)
+				.skip((page - 1) * limit)
+				.limit(limit)
+				.sort({ createdAt: -1 }),
+			HomestayModel.countDocuments(filter)
+		]);
+
+		sendSuccess(res, {
+			homestays,
+			pagination: getPaginationMeta(page, limit, totalResults)
+		});
+	} catch (error) {
+		console.error('Error fetching homestays:', error);
+		sendError(res, 'Failed to fetch homestays', 500);
 	}
-
-	if (minPrice !== undefined) {
-		filtered = filtered.filter(h => h.pricing.basePrice >= minPrice);
-	}
-
-	if (maxPrice !== undefined) {
-		filtered = filtered.filter(h => h.pricing.basePrice <= maxPrice);
-	}
-
-	// Paginate results
-	const startIndex = (page - 1) * limit;
-	const paginatedHomestays = filtered.slice(startIndex, startIndex + limit);
-
-	sendSuccess(res, {
-		homestays: paginatedHomestays,
-		pagination: getPaginationMeta(page, limit, filtered.length)
-	});
 }
 
 /**
@@ -72,16 +81,21 @@ export function getAllHomestays(req: Request, res: Response): void {
  *
  * Retrieves a single homestay by ID.
  */
-export function getHomestayById(req: Request, res: Response): void {
-	const { id } = req.params;
-	const homestay = homestaysStore.find(h => h._id === id);
+export async function getHomestayById(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const homestay = await HomestayModel.findById(id);
 
-	if (!homestay) {
-		sendError(res, 'Homestay not found', 404);
-		return;
+		if (!homestay) {
+			sendError(res, 'Homestay not found', 404);
+			return;
+		}
+
+		sendSuccess(res, homestay);
+	} catch (error) {
+		console.error('Error fetching homestay:', error);
+		sendError(res, 'Failed to fetch homestay', 500);
 	}
-
-	sendSuccess(res, homestay);
 }
 
 /**
@@ -91,34 +105,36 @@ export function getHomestayById(req: Request, res: Response): void {
  *
  * Request body: CreateHomestayInput
  */
-export function createHomestay(req: Request, res: Response): void {
-	const input: CreateHomestayInput = req.body;
+export async function createHomestay(req: Request, res: Response): Promise<void> {
+	try {
+		const input: CreateHomestayInput = req.body;
 
-	// Basic validation
-	const errors = [];
-	if (!input.title) {
-		errors.push({ field: 'title', message: 'Title is required' });
+		// Create new homestay document
+		const newHomestay = new HomestayModel({
+			...input,
+			status: 'active'
+		});
+
+		// Save to database (validation happens automatically via schema)
+		await newHomestay.save();
+
+		sendSuccess(res, newHomestay, 201, 'Homestay created successfully');
+	} catch (error: unknown) {
+		console.error('Error creating homestay:', error);
+
+		// Handle Mongoose validation errors
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to create homestay', 500);
 	}
-	if (!input.pricing?.basePrice || input.pricing.basePrice < 100) {
-		errors.push({ field: 'pricing.basePrice', message: 'Base price must be at least 100' });
-	}
-
-	if (errors.length > 0) {
-		sendError(res, 'Validation failed', 400, errors);
-		return;
-	}
-
-	const now = new Date();
-	const newHomestay: Homestay = {
-		_id: generateId(),
-		...input,
-		status: 'active',
-		createdAt: now,
-		updatedAt: now
-	};
-
-	homestaysStore.push(newHomestay);
-	sendSuccess(res, newHomestay, 201, 'Homestay created successfully');
 }
 
 /**
@@ -129,28 +145,38 @@ export function createHomestay(req: Request, res: Response): void {
  *
  * Request body: UpdateHomestayInput
  */
-export function updateHomestay(req: Request, res: Response): void {
-	const { id } = req.params;
-	const updates: UpdateHomestayInput = req.body;
+export async function updateHomestay(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const updates: UpdateHomestayInput = req.body;
 
-	const index = homestaysStore.findIndex(h => h._id === id);
+		const updatedHomestay = await HomestayModel.findByIdAndUpdate(
+			id,
+			{ $set: updates },
+			{ new: true, runValidators: true }
+		);
 
-	if (index === -1) {
-		sendError(res, 'Homestay not found', 404);
-		return;
+		if (!updatedHomestay) {
+			sendError(res, 'Homestay not found', 404);
+			return;
+		}
+
+		sendSuccess(res, updatedHomestay, 200, 'Homestay updated successfully');
+	} catch (error: unknown) {
+		console.error('Error updating homestay:', error);
+
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to update homestay', 500);
 	}
-
-	// Merge updates with existing homestay
-	const updatedHomestay: Homestay = {
-		...homestaysStore[index],
-		...updates,
-		_id: homestaysStore[index]._id, // Prevent ID modification
-		createdAt: homestaysStore[index].createdAt, // Prevent createdAt modification
-		updatedAt: new Date()
-	};
-
-	homestaysStore[index] = updatedHomestay;
-	sendSuccess(res, updatedHomestay, 200, 'Homestay updated successfully');
 }
 
 /**
@@ -158,15 +184,19 @@ export function updateHomestay(req: Request, res: Response): void {
  *
  * Deletes a homestay listing.
  */
-export function deleteHomestay(req: Request, res: Response): void {
-	const { id } = req.params;
-	const index = homestaysStore.findIndex(h => h._id === id);
+export async function deleteHomestay(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const deletedHomestay = await HomestayModel.findByIdAndDelete(id);
 
-	if (index === -1) {
-		sendError(res, 'Homestay not found', 404);
-		return;
+		if (!deletedHomestay) {
+			sendError(res, 'Homestay not found', 404);
+			return;
+		}
+
+		sendSuccess(res, null, 200, 'Homestay deleted successfully');
+	} catch (error) {
+		console.error('Error deleting homestay:', error);
+		sendError(res, 'Failed to delete homestay', 500);
 	}
-
-	homestaysStore.splice(index, 1);
-	sendSuccess(res, null, 200, 'Homestay deleted successfully');
 }

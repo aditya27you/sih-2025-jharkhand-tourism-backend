@@ -2,21 +2,20 @@
  * Products Controller
  *
  * Handles all CRUD operations for product listings.
+ * Uses MongoDB via Mongoose for data persistence.
  */
 
 import { Request, Response } from 'express';
 import {
-	Product,
+	ProductModel,
 	CreateProductInput,
-	UpdateProductInput,
-	productsStore
+	UpdateProductInput
 } from '../models/products/Product.model';
 import {
 	sendSuccess,
 	sendError,
 	getPaginationMeta,
-	parsePaginationParams,
-	generateId
+	parsePaginationParams
 } from '../utils/response.utils';
 
 /**
@@ -29,31 +28,39 @@ import {
  * - limit: Items per page (default: 12, max: 100)
  * - category: Filter by category
  */
-export function getAllProducts(req: Request, res: Response): void {
-	const { page, limit } = parsePaginationParams(
-		req.query.page as string,
-		req.query.limit as string,
-		12 // Default limit for products
-	);
-	const category = req.query.category as string | undefined;
-
-	// Apply filters
-	let filtered = [...productsStore];
-
-	if (category) {
-		filtered = filtered.filter(p =>
-			p.category.toLowerCase() === category.toLowerCase()
+export async function getAllProducts(req: Request, res: Response): Promise<void> {
+	try {
+		const { page, limit } = parsePaginationParams(
+			req.query.page as string,
+			req.query.limit as string,
+			12 // Default limit for products
 		);
+		const category = req.query.category as string | undefined;
+
+		// Build query filter
+		const filter: Record<string, unknown> = {};
+
+		if (category) {
+			filter.category = new RegExp(`^${category}$`, 'i');
+		}
+
+		// Execute query with pagination
+		const [products, totalResults] = await Promise.all([
+			ProductModel.find(filter)
+				.skip((page - 1) * limit)
+				.limit(limit)
+				.sort({ createdAt: -1 }),
+			ProductModel.countDocuments(filter)
+		]);
+
+		sendSuccess(res, {
+			products,
+			pagination: getPaginationMeta(page, limit, totalResults)
+		});
+	} catch (error) {
+		console.error('Error fetching products:', error);
+		sendError(res, 'Failed to fetch products', 500);
 	}
-
-	// Paginate results
-	const startIndex = (page - 1) * limit;
-	const paginatedProducts = filtered.slice(startIndex, startIndex + limit);
-
-	sendSuccess(res, {
-		products: paginatedProducts,
-		pagination: getPaginationMeta(page, limit, filtered.length)
-	});
 }
 
 /**
@@ -61,16 +68,21 @@ export function getAllProducts(req: Request, res: Response): void {
  *
  * Retrieves a single product by ID.
  */
-export function getProductById(req: Request, res: Response): void {
-	const { id } = req.params;
-	const product = productsStore.find(p => p._id === id);
+export async function getProductById(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const product = await ProductModel.findById(id);
 
-	if (!product) {
-		sendError(res, 'Product not found', 404);
-		return;
+		if (!product) {
+			sendError(res, 'Product not found', 404);
+			return;
+		}
+
+		sendSuccess(res, product);
+	} catch (error) {
+		console.error('Error fetching product:', error);
+		sendError(res, 'Failed to fetch product', 500);
 	}
-
-	sendSuccess(res, product);
 }
 
 /**
@@ -80,36 +92,32 @@ export function getProductById(req: Request, res: Response): void {
  *
  * Request body: CreateProductInput
  */
-export function createProduct(req: Request, res: Response): void {
-	const input: CreateProductInput = req.body;
+export async function createProduct(req: Request, res: Response): Promise<void> {
+	try {
+		const input: CreateProductInput = req.body;
 
-	// Basic validation
-	const errors = [];
-	if (!input.title) {
-		errors.push({ field: 'title', message: 'Title is required' });
-	}
-	if (!input.price?.amount || input.price.amount <= 0) {
-		errors.push({ field: 'price.amount', message: 'Price amount must be greater than 0' });
-	}
-	if (input.stock === undefined || input.stock < 0) {
-		errors.push({ field: 'stock', message: 'Stock must be 0 or greater' });
-	}
+		// Create new product document
+		const newProduct = new ProductModel(input);
 
-	if (errors.length > 0) {
-		sendError(res, 'Validation failed', 400, errors);
-		return;
+		// Save to database
+		await newProduct.save();
+
+		sendSuccess(res, newProduct, 201, 'Product created successfully');
+	} catch (error: unknown) {
+		console.error('Error creating product:', error);
+
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to create product', 500);
 	}
-
-	const now = new Date();
-	const newProduct: Product = {
-		_id: generateId(),
-		...input,
-		createdAt: now,
-		updatedAt: now
-	};
-
-	productsStore.push(newProduct);
-	sendSuccess(res, newProduct, 201, 'Product created successfully');
 }
 
 /**
@@ -120,28 +128,38 @@ export function createProduct(req: Request, res: Response): void {
  *
  * Request body: UpdateProductInput
  */
-export function updateProduct(req: Request, res: Response): void {
-	const { id } = req.params;
-	const updates: UpdateProductInput = req.body;
+export async function updateProduct(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const updates: UpdateProductInput = req.body;
 
-	const index = productsStore.findIndex(p => p._id === id);
+		const updatedProduct = await ProductModel.findByIdAndUpdate(
+			id,
+			{ $set: updates },
+			{ new: true, runValidators: true }
+		);
 
-	if (index === -1) {
-		sendError(res, 'Product not found', 404);
-		return;
+		if (!updatedProduct) {
+			sendError(res, 'Product not found', 404);
+			return;
+		}
+
+		sendSuccess(res, updatedProduct, 200, 'Product updated successfully');
+	} catch (error: unknown) {
+		console.error('Error updating product:', error);
+
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to update product', 500);
 	}
-
-	// Merge updates with existing product
-	const updatedProduct: Product = {
-		...productsStore[index],
-		...updates,
-		_id: productsStore[index]._id,
-		createdAt: productsStore[index].createdAt,
-		updatedAt: new Date()
-	};
-
-	productsStore[index] = updatedProduct;
-	sendSuccess(res, updatedProduct, 200, 'Product updated successfully');
 }
 
 /**
@@ -149,15 +167,19 @@ export function updateProduct(req: Request, res: Response): void {
  *
  * Deletes a product listing.
  */
-export function deleteProduct(req: Request, res: Response): void {
-	const { id } = req.params;
-	const index = productsStore.findIndex(p => p._id === id);
+export async function deleteProduct(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const deletedProduct = await ProductModel.findByIdAndDelete(id);
 
-	if (index === -1) {
-		sendError(res, 'Product not found', 404);
-		return;
+		if (!deletedProduct) {
+			sendError(res, 'Product not found', 404);
+			return;
+		}
+
+		sendSuccess(res, null, 200, 'Product deleted successfully');
+	} catch (error) {
+		console.error('Error deleting product:', error);
+		sendError(res, 'Failed to delete product', 500);
 	}
-
-	productsStore.splice(index, 1);
-	sendSuccess(res, null, 200, 'Product deleted successfully');
 }

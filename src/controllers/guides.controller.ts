@@ -2,21 +2,20 @@
  * Guides Controller
  *
  * Handles all CRUD operations for guide profiles.
+ * Uses MongoDB via Mongoose for data persistence.
  */
 
 import { Request, Response } from 'express';
 import {
-	Guide,
+	GuideModel,
 	CreateGuideInput,
-	UpdateGuideInput,
-	guidesStore
+	UpdateGuideInput
 } from '../models/guides/Guide.model';
 import {
 	sendSuccess,
 	sendError,
 	getPaginationMeta,
-	parsePaginationParams,
-	generateId
+	parsePaginationParams
 } from '../utils/response.utils';
 
 /**
@@ -29,32 +28,38 @@ import {
  * - limit: Items per page (default: 10, max: 100)
  * - specialization: Filter by specialization
  */
-export function getAllGuides(req: Request, res: Response): void {
-	const { page, limit } = parsePaginationParams(
-		req.query.page as string,
-		req.query.limit as string
-	);
-	const specialization = req.query.specialization as string | undefined;
-
-	// Apply filters
-	let filtered = [...guidesStore];
-
-	if (specialization) {
-		filtered = filtered.filter(g =>
-			g.specializations.some(s =>
-				s.toLowerCase() === specialization.toLowerCase()
-			)
+export async function getAllGuides(req: Request, res: Response): Promise<void> {
+	try {
+		const { page, limit } = parsePaginationParams(
+			req.query.page as string,
+			req.query.limit as string
 		);
+		const specialization = req.query.specialization as string | undefined;
+
+		// Build query filter
+		const filter: Record<string, unknown> = {};
+
+		if (specialization) {
+			filter.specializations = new RegExp(`^${specialization}$`, 'i');
+		}
+
+		// Execute query with pagination
+		const [guides, totalResults] = await Promise.all([
+			GuideModel.find(filter)
+				.skip((page - 1) * limit)
+				.limit(limit)
+				.sort({ createdAt: -1 }),
+			GuideModel.countDocuments(filter)
+		]);
+
+		sendSuccess(res, {
+			guides,
+			pagination: getPaginationMeta(page, limit, totalResults)
+		});
+	} catch (error) {
+		console.error('Error fetching guides:', error);
+		sendError(res, 'Failed to fetch guides', 500);
 	}
-
-	// Paginate results
-	const startIndex = (page - 1) * limit;
-	const paginatedGuides = filtered.slice(startIndex, startIndex + limit);
-
-	sendSuccess(res, {
-		guides: paginatedGuides,
-		pagination: getPaginationMeta(page, limit, filtered.length)
-	});
 }
 
 /**
@@ -62,16 +67,21 @@ export function getAllGuides(req: Request, res: Response): void {
  *
  * Retrieves a single guide by ID.
  */
-export function getGuideById(req: Request, res: Response): void {
-	const { id } = req.params;
-	const guide = guidesStore.find(g => g._id === id);
+export async function getGuideById(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const guide = await GuideModel.findById(id);
 
-	if (!guide) {
-		sendError(res, 'Guide not found', 404);
-		return;
+		if (!guide) {
+			sendError(res, 'Guide not found', 404);
+			return;
+		}
+
+		sendSuccess(res, guide);
+	} catch (error) {
+		console.error('Error fetching guide:', error);
+		sendError(res, 'Failed to fetch guide', 500);
 	}
-
-	sendSuccess(res, guide);
 }
 
 /**
@@ -81,36 +91,32 @@ export function getGuideById(req: Request, res: Response): void {
  *
  * Request body: CreateGuideInput
  */
-export function createGuide(req: Request, res: Response): void {
-	const input: CreateGuideInput = req.body;
+export async function createGuide(req: Request, res: Response): Promise<void> {
+	try {
+		const input: CreateGuideInput = req.body;
 
-	// Basic validation
-	const errors = [];
-	if (!input.name) {
-		errors.push({ field: 'name', message: 'Name is required' });
-	}
-	if (!input.bio) {
-		errors.push({ field: 'bio', message: 'Bio is required' });
-	}
-	if (!input.pricing?.fullDay) {
-		errors.push({ field: 'pricing.fullDay', message: 'Full day pricing is required' });
-	}
+		// Create new guide document
+		const newGuide = new GuideModel(input);
 
-	if (errors.length > 0) {
-		sendError(res, 'Validation failed', 400, errors);
-		return;
+		// Save to database
+		await newGuide.save();
+
+		sendSuccess(res, newGuide, 201, 'Guide profile created successfully');
+	} catch (error: unknown) {
+		console.error('Error creating guide:', error);
+
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to create guide', 500);
 	}
-
-	const now = new Date();
-	const newGuide: Guide = {
-		_id: generateId(),
-		...input,
-		createdAt: now,
-		updatedAt: now
-	};
-
-	guidesStore.push(newGuide);
-	sendSuccess(res, newGuide, 201, 'Guide profile created successfully');
 }
 
 /**
@@ -121,28 +127,38 @@ export function createGuide(req: Request, res: Response): void {
  *
  * Request body: UpdateGuideInput
  */
-export function updateGuide(req: Request, res: Response): void {
-	const { id } = req.params;
-	const updates: UpdateGuideInput = req.body;
+export async function updateGuide(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const updates: UpdateGuideInput = req.body;
 
-	const index = guidesStore.findIndex(g => g._id === id);
+		const updatedGuide = await GuideModel.findByIdAndUpdate(
+			id,
+			{ $set: updates },
+			{ new: true, runValidators: true }
+		);
 
-	if (index === -1) {
-		sendError(res, 'Guide not found', 404);
-		return;
+		if (!updatedGuide) {
+			sendError(res, 'Guide not found', 404);
+			return;
+		}
+
+		sendSuccess(res, updatedGuide, 200, 'Guide profile updated successfully');
+	} catch (error: unknown) {
+		console.error('Error updating guide:', error);
+
+		if (error instanceof Error && error.name === 'ValidationError') {
+			const mongooseError = error as unknown as { errors: Record<string, { message: string }> };
+			const validationErrors = Object.keys(mongooseError.errors).map(field => ({
+				field,
+				message: mongooseError.errors[field].message
+			}));
+			sendError(res, 'Validation failed', 400, validationErrors);
+			return;
+		}
+
+		sendError(res, 'Failed to update guide', 500);
 	}
-
-	// Merge updates with existing guide
-	const updatedGuide: Guide = {
-		...guidesStore[index],
-		...updates,
-		_id: guidesStore[index]._id,
-		createdAt: guidesStore[index].createdAt,
-		updatedAt: new Date()
-	};
-
-	guidesStore[index] = updatedGuide;
-	sendSuccess(res, updatedGuide, 200, 'Guide profile updated successfully');
 }
 
 /**
@@ -150,15 +166,19 @@ export function updateGuide(req: Request, res: Response): void {
  *
  * Deletes a guide profile.
  */
-export function deleteGuide(req: Request, res: Response): void {
-	const { id } = req.params;
-	const index = guidesStore.findIndex(g => g._id === id);
+export async function deleteGuide(req: Request, res: Response): Promise<void> {
+	try {
+		const { id } = req.params;
+		const deletedGuide = await GuideModel.findByIdAndDelete(id);
 
-	if (index === -1) {
-		sendError(res, 'Guide not found', 404);
-		return;
+		if (!deletedGuide) {
+			sendError(res, 'Guide not found', 404);
+			return;
+		}
+
+		sendSuccess(res, null, 200, 'Guide profile deleted successfully');
+	} catch (error) {
+		console.error('Error deleting guide:', error);
+		sendError(res, 'Failed to delete guide', 500);
 	}
-
-	guidesStore.splice(index, 1);
-	sendSuccess(res, null, 200, 'Guide profile deleted successfully');
 }
